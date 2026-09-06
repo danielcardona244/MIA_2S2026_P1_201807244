@@ -3,9 +3,7 @@
 
 #include <ctime>
 
-// Estructuras binarias del Proyecto 1.
-// Se usa el alineamiento natural de C++ (sin #pragma pack), siguiendo
-// el ejemplo del auxiliar. Los offsets se calculan siempre con sizeof(...).
+// Estructuras binarias 
 
 typedef struct {
     char part_status = '0';
