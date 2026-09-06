@@ -1,0 +1,50 @@
+# =========================
+# C++ / CMake
+# =========================
+backend/build/
+build/
+
+*.o
+*.out
+*.exe
+
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# =========================
+# Virtual disks
+# =========================
+*.mia
+
+# =========================
+# Generated reports
+# =========================
+reports/*
+!reports/.gitkeep
+
+*.dot
+
+# =========================
+# Frontend
+# =========================
+frontend/node_modules/
+frontend/dist/
+
+# =========================
+# IDEs
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.log
