@@ -1,0 +1,36 @@
+# Prueba Sprint 1 - Discos y particiones
+# Crear discos
+mkdisk -size=5 -unit=M -path=/tmp/test_mia/disco1.mia
+mkdisk -size=3000 -unit=K -path=/tmp/test_mia/disco2.mia
+
+# Crear particiones en disco1
+fdisk -size=500 -unit=K -path=/tmp/test_mia/disco1.mia -name=Part1
+fdisk -size=500 -unit=K -path=/tmp/test_mia/disco1.mia -name=Part2
+fdisk -type=E -size=1 -unit=M -path=/tmp/test_mia/disco1.mia -name=Part3
+fdisk -type=L -size=200 -unit=K -path=/tmp/test_mia/disco1.mia -name=LogPart1
+
+# Crear particion en disco2
+fdisk -size=1000 -unit=K -path=/tmp/test_mia/disco2.mia -name=PartA
+
+# Montar particiones
+mount -path=/tmp/test_mia/disco1.mia -name=Part1
+mount -path=/tmp/test_mia/disco1.mia -name=Part2
+mount -path=/tmp/test_mia/disco2.mia -name=PartA
+
+# Listar montadas
+mounted
+
+# Pruebas de error
+mkdisk -size=-5 -path=/tmp/test_mia/error.mia
+fdisk -size=100 -path=/tmp/no_existe.mia -name=X
+fdisk -size=500 -unit=K -path=/tmp/test_mia/disco1.mia -name=Part1
+
+# Errores nuevos del Sprint 1 corregido
+mkdisk -size=10abc -path=/tmp/test_mia/bad.mia
+mkdisk -size=10 -path=/tmp/test_mia/bad.dsk
+mkdisk -size=10 -path=/tmp/test_mia/d.mia -foo=bar
+fdisk -size=100 -unit=K -path=/tmp/test_mia/disco1.mia -name=TestNombreMuyLargoo
+mounted -foo=bar
+
+# Eliminar disco2
+rmdisk -path=/tmp/test_mia/disco2.mia

@@ -5,8 +5,19 @@
 
 #include <iostream>
 #include <sstream>
+#include <set>
+#include <cctype>
 
 using namespace std;
+
+// parametros permitidos por cada comando del sprint 1
+static const map<string, set<string>> allowed_params = {
+    {"mkdisk",  {"size", "fit", "unit", "path"}},
+    {"rmdisk",  {"path"}},
+    {"fdisk",   {"size", "unit", "path", "type", "fit", "name"}},
+    {"mount",   {"path", "name"}},
+    {"mounted", {}},
+};
 
 // separar tokens por espacios, respetando comillas dobles
 vector<string> tokenize(const string& input) {
@@ -14,12 +25,11 @@ vector<string> tokenize(const string& input) {
     string current;
     bool in_quotes = false;
 
-    for (int i = 0; i < input.size(); i++) {
+    for (int i = 0; i < (int)input.size(); i++) {
         char c = input[i];
         if (c == '"') {
             in_quotes = !in_quotes;
-            // no incluir las comillas en el token
-        } else if (c == ' ' && !in_quotes) {
+        } else if (isspace(static_cast<unsigned char>(c)) && !in_quotes) {
             if (!current.empty()) {
                 tokens.push_back(current);
                 current.clear();
@@ -45,7 +55,7 @@ pair<string, string> split_param(const string& token) {
 
     size_t eq = t.find('=');
     if (eq == string::npos) {
-        // parametro tipo flag (sin valor), como -r o -p
+        // flag sin valor, como -r o -p (se usa en comandos futuros)
         return {to_lower(t), ""};
     }
 
@@ -58,7 +68,6 @@ pair<string, string> split_param(const string& token) {
 void process_line(const string& line) {
     string trimmed = trim(line);
 
-    // linea vacia
     if (trimmed.empty()) {
         return;
     }
@@ -66,6 +75,16 @@ void process_line(const string& line) {
     // comentario
     if (trimmed[0] == '#') {
         cout << trimmed << endl;
+        return;
+    }
+
+    // detectar comillas sin cerrar
+    int quote_count = 0;
+    for (char c : trimmed) {
+        if (c == '"') quote_count++;
+    }
+    if (quote_count % 2 != 0) {
+        cout << "[ERROR] comillas dobles sin cerrar" << endl;
         return;
     }
 
@@ -78,13 +97,56 @@ void process_line(const string& line) {
 
     // extraer parametros
     map<string, string> params;
-    for (int i = 1; i < tokens.size(); i++) {
+    for (int i = 1; i < (int)tokens.size(); i++) {
+        // cada parametro debe iniciar con '-'
+        if (tokens[i][0] != '-') {
+            cout << "[ERROR] " << to_upper(cmd)
+                 << ": parametro debe iniciar con '-': " << tokens[i] << endl;
+            return;
+        }
+
         auto [key, value] = split_param(tokens[i]);
+
+        // key vacio: caso "-=10"
+        if (key.empty()) {
+            cout << "[ERROR] " << to_upper(cmd)
+                 << ": parametro mal formado: " << tokens[i] << endl;
+            return;
+        }
+
+        // tiene '=' pero sin valor: caso "-size="
+        bool has_eq = (tokens[i].find('=') != string::npos);
+        if (has_eq && value.empty()) {
+            cout << "[ERROR] " << to_upper(cmd)
+                 << ": parametro sin valor: " << tokens[i] << endl;
+            return;
+        }
+
+        // parametro repetido
         if (params.find(key) != params.end()) {
-            cout << "[ERROR] parametro " << key << " repetido" << endl;
+            cout << "[ERROR] " << to_upper(cmd)
+                 << ": parametro -" << key << " repetido" << endl;
             return;
         }
         params[key] = value;
+    }
+
+    // validar parametros permitidos para el comando
+    if (allowed_params.count(cmd)) {
+        const auto& allowed = allowed_params.at(cmd);
+        for (auto& [key, val] : params) {
+            if (allowed.find(key) == allowed.end()) {
+                cout << "[ERROR] " << to_upper(cmd)
+                     << ": parametro no reconocido -" << key << endl;
+                return;
+            }
+            // en Sprint 1 todos los parametros requieren valor (no hay flags)
+            if (val.empty()) {
+                cout << "[ERROR] " << to_upper(cmd)
+                     << ": parametro -" << key << " requiere un valor" << endl;
+                return;
+            }
+        }
     }
 
     // despachar al comando correspondiente

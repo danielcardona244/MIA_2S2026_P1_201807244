@@ -48,3 +48,10 @@ frontend/dist/
 # =========================
 *.tmp
 *.log
+
+# =========================
+# Checkpoints / contexto
+# =========================
+checkpoint_*.zip
+contexto_proyecto.txt
+contexto_completo_proyecto.txt
