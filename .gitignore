@@ -19,7 +19,7 @@ Makefile
 *.mia
 
 # =========================
-# Generated reports
+# reprotes generados
 # =========================
 reports/*
 !reports/.gitkeep
@@ -39,19 +39,17 @@ frontend/dist/
 .idea/
 
 # =========================
-# OS
-# =========================
-.DS_Store
-
-# =========================
-# Temporary files
+# archivos temporales
 # =========================
 *.tmp
 *.log
 
 # =========================
-# Checkpoints / contexto
+# Tests
 # =========================
-checkpoint_*.zip
-contexto_proyecto.txt
-contexto_completo_proyecto.txt
+scripts/test_sprint1.sh
+backend/tests/
+scripts/test_sprint1.smia 
+backend/tests/
+
+

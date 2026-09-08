@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <ctime>
 
 using namespace std;
 
@@ -117,6 +118,25 @@ void cmd_mount(map<string, string>& params) {
     memcpy(mbr.mbr_partitions[part_idx].part_id, id.c_str(), 4);
 
     write_mbr(path, mbr);
+
+    // Si la particion ya estaba formateada como EXT2, actualizar la informacion
+    // de montaje del superbloque. En un primer montaje previo a MKFS estos bytes
+    // aun no representan un superbloque valido y simplemente se omiten.
+    {
+        FILE* fs_file = fopen(path.c_str(), "r+b");
+        if (fs_file != NULL) {
+            Superblock sb;
+            fseek(fs_file, mbr.mbr_partitions[part_idx].part_start, SEEK_SET);
+            if (fread(&sb, sizeof(Superblock), 1, fs_file) == 1 &&
+                sb.s_magic == 0xEF53 && sb.s_filesystem_type == 2) {
+                sb.s_mtime = time(nullptr);
+                sb.s_mnt_count++;
+                fseek(fs_file, mbr.mbr_partitions[part_idx].part_start, SEEK_SET);
+                fwrite(&sb, sizeof(Superblock), 1, fs_file);
+            }
+            fclose(fs_file);
+        }
+    }
 
     // agregar a la tabla de montajes en RAM
     MountEntry entry;

@@ -2,6 +2,8 @@
 #include "shared.h"
 #include "disk.h"
 #include "mount.h"
+#include "filesystem.h"
+#include "users.h"
 
 #include <iostream>
 #include <sstream>
@@ -10,13 +12,21 @@
 
 using namespace std;
 
-// parametros permitidos por cada comando del sprint 1
+// Parametros permitidos por los comandos implementados hasta Sprint 2.
 static const map<string, set<string>> allowed_params = {
     {"mkdisk",  {"size", "fit", "unit", "path"}},
     {"rmdisk",  {"path"}},
     {"fdisk",   {"size", "unit", "path", "type", "fit", "name"}},
     {"mount",   {"path", "name"}},
     {"mounted", {}},
+    {"mkfs",    {"id", "type"}},
+    {"login",   {"user", "pass", "id"}},
+    {"logout",  {}},
+    {"mkgrp",   {"name"}},
+    {"rmgrp",   {"name"}},
+    {"mkusr",   {"user", "pass", "grp"}},
+    {"rmusr",   {"user"}},
+    {"chgrp",   {"user", "grp"}},
 };
 
 // separar tokens por espacios, respetando comillas dobles
@@ -38,47 +48,31 @@ vector<string> tokenize(const string& input) {
             current += c;
         }
     }
-    if (!current.empty()) {
-        tokens.push_back(current);
-    }
+    if (!current.empty()) tokens.push_back(current);
     return tokens;
 }
 
-// separar un token tipo "-param=valor" en key y value
 pair<string, string> split_param(const string& token) {
     string t = token;
-
-    // quitar el guion inicial
-    if (!t.empty() && t[0] == '-') {
-        t = t.substr(1);
-    }
+    if (!t.empty() && t[0] == '-') t = t.substr(1);
 
     size_t eq = t.find('=');
-    if (eq == string::npos) {
-        // flag sin valor, como -r o -p (se usa en comandos futuros)
-        return {to_lower(t), ""};
-    }
+    if (eq == string::npos) return {to_lower(t), ""};
 
     string key = to_lower(t.substr(0, eq));
     string value = t.substr(eq + 1);
     return {key, value};
 }
 
-// procesar una sola linea de comando
 void process_line(const string& line) {
     string trimmed = trim(line);
+    if (trimmed.empty()) return;
 
-    if (trimmed.empty()) {
-        return;
-    }
-
-    // comentario
     if (trimmed[0] == '#') {
         cout << trimmed << endl;
         return;
     }
 
-    // detectar comillas sin cerrar
     int quote_count = 0;
     for (char c : trimmed) {
         if (c == '"') quote_count++;
@@ -88,33 +82,26 @@ void process_line(const string& line) {
         return;
     }
 
-    // tokenizar
     vector<string> tokens = tokenize(trimmed);
     if (tokens.empty()) return;
 
-    // primer token es el comando
     string cmd = to_lower(tokens[0]);
 
-    // extraer parametros
     map<string, string> params;
     for (int i = 1; i < (int)tokens.size(); i++) {
-        // cada parametro debe iniciar con '-'
-        if (tokens[i][0] != '-') {
+        if (tokens[i].empty() || tokens[i][0] != '-') {
             cout << "[ERROR] " << to_upper(cmd)
                  << ": parametro debe iniciar con '-': " << tokens[i] << endl;
             return;
         }
 
         auto [key, value] = split_param(tokens[i]);
-
-        // key vacio: caso "-=10"
         if (key.empty()) {
             cout << "[ERROR] " << to_upper(cmd)
                  << ": parametro mal formado: " << tokens[i] << endl;
             return;
         }
 
-        // tiene '=' pero sin valor: caso "-size="
         bool has_eq = (tokens[i].find('=') != string::npos);
         if (has_eq && value.empty()) {
             cout << "[ERROR] " << to_upper(cmd)
@@ -122,7 +109,6 @@ void process_line(const string& line) {
             return;
         }
 
-        // parametro repetido
         if (params.find(key) != params.end()) {
             cout << "[ERROR] " << to_upper(cmd)
                  << ": parametro -" << key << " repetido" << endl;
@@ -131,7 +117,6 @@ void process_line(const string& line) {
         params[key] = value;
     }
 
-    // validar parametros permitidos para el comando
     if (allowed_params.count(cmd)) {
         const auto& allowed = allowed_params.at(cmd);
         for (auto& [key, val] : params) {
@@ -140,7 +125,6 @@ void process_line(const string& line) {
                      << ": parametro no reconocido -" << key << endl;
                 return;
             }
-            // en Sprint 1 todos los parametros requieren valor (no hay flags)
             if (val.empty()) {
                 cout << "[ERROR] " << to_upper(cmd)
                      << ": parametro -" << key << " requiere un valor" << endl;
@@ -149,7 +133,6 @@ void process_line(const string& line) {
         }
     }
 
-    // despachar al comando correspondiente
     if (cmd == "mkdisk") {
         cmd_mkdisk(params);
     } else if (cmd == "rmdisk") {
@@ -160,6 +143,22 @@ void process_line(const string& line) {
         cmd_mount(params);
     } else if (cmd == "mounted") {
         cmd_mounted();
+    } else if (cmd == "mkfs") {
+        cmd_mkfs(params);
+    } else if (cmd == "login") {
+        cmd_login(params);
+    } else if (cmd == "logout") {
+        cmd_logout();
+    } else if (cmd == "mkgrp") {
+        cmd_mkgrp(params);
+    } else if (cmd == "rmgrp") {
+        cmd_rmgrp(params);
+    } else if (cmd == "mkusr") {
+        cmd_mkusr(params);
+    } else if (cmd == "rmusr") {
+        cmd_rmusr(params);
+    } else if (cmd == "chgrp") {
+        cmd_chgrp(params);
     } else if (cmd == "exit") {
         // se maneja en main
     } else {
@@ -167,11 +166,8 @@ void process_line(const string& line) {
     }
 }
 
-// procesar bloque de texto completo (varias lineas)
 void process_input(const string& text) {
     istringstream stream(text);
     string line;
-    while (getline(stream, line)) {
-        process_line(line);
-    }
+    while (getline(stream, line)) process_line(line);
 }
