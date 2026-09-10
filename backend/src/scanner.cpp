@@ -12,7 +12,7 @@
 
 using namespace std;
 
-// Parametros permitidos por los comandos implementados hasta Sprint 2.
+// Parametros permitidos por los comandos implementados hasta Sprint 4.
 static const map<string, set<string>> allowed_params = {
     {"mkdisk",  {"size", "fit", "unit", "path"}},
     {"rmdisk",  {"path"}},
@@ -27,6 +27,17 @@ static const map<string, set<string>> allowed_params = {
     {"mkusr",   {"user", "pass", "grp"}},
     {"rmusr",   {"user"}},
     {"chgrp",   {"user", "grp"}},
+    {"mkfile",  {"path", "r", "size", "cont"}},
+    {"mkdir",   {"path", "p"}},
+    {"chmod",   {"path", "ugo", "r"}},
+    {"chown",   {"path", "user", "r"}},
+};
+
+static const map<string, set<string>> flag_params = {
+    {"mkfile", {"r"}},
+    {"mkdir",  {"p"}},
+    {"chmod",  {"r"}},
+    {"chown",  {"r"}},
 };
 
 // separar tokens por espacios, respetando comillas dobles
@@ -117,15 +128,35 @@ void process_line(const string& line) {
         params[key] = value;
     }
 
-    if (allowed_params.count(cmd)) {
+    if (cmd == "cat") {
+        for (auto& [key, val] : params) {
+            bool valid_key = key.rfind("file", 0) == 0 && key.size() > 4;
+            int number = 0;
+            if (!valid_key || !strict_stoi(key.substr(4), number) || number <= 0) {
+                cout << "[ERROR] CAT: parametro no reconocido -" << key << endl;
+                return;
+            }
+            if (val.empty()) {
+                cout << "[ERROR] CAT: parametro -" << key << " requiere un valor" << endl;
+                return;
+            }
+        }
+    } else if (allowed_params.count(cmd)) {
         const auto& allowed = allowed_params.at(cmd);
+        const set<string> empty_flags = flag_params.count(cmd) ? flag_params.at(cmd) : set<string>{};
         for (auto& [key, val] : params) {
             if (allowed.find(key) == allowed.end()) {
                 cout << "[ERROR] " << to_upper(cmd)
                      << ": parametro no reconocido -" << key << endl;
                 return;
             }
-            if (val.empty()) {
+            bool is_flag = empty_flags.find(key) != empty_flags.end();
+            if (is_flag && !val.empty()) {
+                cout << "[ERROR] " << to_upper(cmd)
+                     << ": parametro -" << key << " no recibe valor" << endl;
+                return;
+            }
+            if (!is_flag && val.empty()) {
                 cout << "[ERROR] " << to_upper(cmd)
                      << ": parametro -" << key << " requiere un valor" << endl;
                 return;
@@ -159,6 +190,16 @@ void process_line(const string& line) {
         cmd_rmusr(params);
     } else if (cmd == "chgrp") {
         cmd_chgrp(params);
+    } else if (cmd == "mkfile") {
+        cmd_mkfile(params);
+    } else if (cmd == "mkdir") {
+        cmd_mkdir(params);
+    } else if (cmd == "cat") {
+        cmd_cat(params);
+    } else if (cmd == "chmod") {
+        cmd_chmod(params);
+    } else if (cmd == "chown") {
+        cmd_chown(params);
     } else if (cmd == "exit") {
         // se maneja en main
     } else {
@@ -171,3 +212,4 @@ void process_input(const string& text) {
     string line;
     while (getline(stream, line)) process_line(line);
 }
+

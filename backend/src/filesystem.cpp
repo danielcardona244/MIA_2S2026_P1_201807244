@@ -3,6 +3,7 @@
 #include "disk.h"
 #include "mount.h"
 #include "shared.h"
+#include "users.h"
 
 #include <algorithm>
 #include <climits>
@@ -11,6 +12,11 @@
 #include <ctime>
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <sstream>
+#include <set>
+#include <functional>
+#include <cctype>
 
 using namespace std;
 
@@ -802,4 +808,909 @@ bool fs_write_users_file(const string& id, const string& content, string& error)
     fflush(file);
     fclose(file);
     return ok;
+}
+
+
+
+// ================================================================
+// Sprint 4 - Archivos, carpetas y permisos
+// ================================================================
+
+namespace {
+
+const char DEFAULT_PERM_664[3] = {'6', '6', '4'};
+
+bool require_fs_session(const string& command) {
+    if (!current_session.active) {
+        cout << "[ERROR] " << command << ": necesita iniciar sesion" << endl;
+        return false;
+    }
+    return true;
+}
+
+bool parse_absolute_path(const string& raw, vector<string>& parts, string& error) {
+    parts.clear();
+    if (raw.empty() || raw[0] != '/') {
+        error = "la ruta debe ser absoluta y comenzar con /";
+        return false;
+    }
+
+    string current;
+    for (size_t i = 1; i <= raw.size(); ++i) {
+        char c = (i < raw.size()) ? raw[i] : '/';
+        if (c == '/') {
+            if (!current.empty()) {
+                if (current == "." || current == "..") {
+                    error = "no se admiten componentes . o .. en la ruta";
+                    return false;
+                }
+                if (current.size() > 12) {
+                    error = "cada nombre de archivo o carpeta admite maximo 12 caracteres";
+                    return false;
+                }
+                parts.push_back(current);
+                current.clear();
+            }
+        } else {
+            current += c;
+        }
+    }
+    return true;
+}
+
+bool permission_digit(const Inode& inode, int& digit) {
+    int pos = 2;
+    if (current_session.uid == inode.i_uid) pos = 0;
+    else if (current_session.gid == inode.i_gid) pos = 1;
+
+    char c = inode.i_perm[pos];
+    if (c < '0' || c > '7') return false;
+    digit = c - '0';
+    return true;
+}
+
+bool has_permission(const Inode& inode, int mask) {
+    // El enunciado establece que root posee 777 sobre cualquier objeto.
+    if (current_session.uid == 1 && current_session.user == "root") return true;
+    int digit = 0;
+    return permission_digit(inode, digit) && (digit & mask) == mask;
+}
+
+int allocate_inode_index(FILE* file, Superblock& sb) {
+    int index = first_free_bitmap(file, sb.s_bm_inode_start, sb.s_inodes_count);
+    if (index < 0) return -1;
+    if (!set_bitmap(file, sb.s_bm_inode_start, sb.s_inodes_count, index, '1')) return -1;
+    if (sb.s_free_inodes_count > 0) sb.s_free_inodes_count--;
+
+    int next = first_free_bitmap(file, sb.s_bm_inode_start, sb.s_inodes_count);
+    sb.s_firts_ino = (next >= 0)
+        ? sb.s_inode_start + next * static_cast<int>(sizeof(Inode))
+        : -1;
+    return index;
+}
+
+bool read_folder_block(FILE* file, const Superblock& sb, int index, FolderBlock& block) {
+    if (index < 0 || index >= sb.s_blocks_count) return false;
+    long long pos = static_cast<long long>(sb.s_block_start) +
+                    static_cast<long long>(index) * BLOCK_SIZE;
+    return read_exact(file, pos, &block, sizeof(FolderBlock));
+}
+
+bool inode_data_blocks(FILE* file,
+                       const Superblock& sb,
+                       const Inode& inode,
+                       vector<int>& blocks,
+                       string& error) {
+    vector<int> pointer_blocks;
+    return collect_inode_blocks(file, sb, inode, blocks, pointer_blocks, error);
+}
+
+bool find_child(FILE* file,
+                const Superblock& sb,
+                const Inode& directory,
+                const string& name,
+                int& child_index,
+                string& error) {
+    if (directory.i_type != '0') {
+        error = "un componente de la ruta no es una carpeta";
+        return false;
+    }
+
+    vector<int> blocks;
+    if (!inode_data_blocks(file, sb, directory, blocks, error)) return false;
+
+    for (int block_index : blocks) {
+        FolderBlock folder{};
+        if (!read_folder_block(file, sb, block_index, folder)) {
+            error = "no se pudo leer un bloque de carpeta";
+            return false;
+        }
+        for (const Content& entry : folder.b_content) {
+            if (entry.b_inodo < 0) continue;
+            if (read_fixed(entry.b_name, 12) == name) {
+                child_index = entry.b_inodo;
+                return true;
+            }
+        }
+    }
+    child_index = -1;
+    return true;
+}
+
+bool resolve_inode_path(FILE* file,
+                        const Superblock& sb,
+                        const vector<string>& parts,
+                        int& inode_index,
+                        Inode& inode,
+                        string& error) {
+    inode_index = ROOT_INODE_INDEX;
+    if (!read_inode(file, sb, inode_index, inode)) {
+        error = "no se pudo leer el inodo raiz";
+        return false;
+    }
+
+    for (const string& part : parts) {
+        int child = -1;
+        if (!find_child(file, sb, inode, part, child, error)) return false;
+        if (child < 0) {
+            error = "no existe la ruta solicitada";
+            return false;
+        }
+        if (!read_inode(file, sb, child, inode)) {
+            error = "no se pudo leer un inodo de la ruta";
+            return false;
+        }
+        inode_index = child;
+    }
+    return true;
+}
+
+bool append_directory_entry(FILE* file,
+                            int partition_start,
+                            Superblock& sb,
+                            int parent_index,
+                            Inode& parent,
+                            const string& name,
+                            int child_index,
+                            string& error) {
+    vector<int> data_blocks, pointer_blocks;
+    if (!collect_inode_blocks(file, sb, parent, data_blocks, pointer_blocks, error)) return false;
+
+    // Primero reutilizar un espacio libre de los bloques actuales.
+    for (int block_index : data_blocks) {
+        FolderBlock folder{};
+        if (!read_folder_block(file, sb, block_index, folder)) {
+            error = "no se pudo leer un bloque de carpeta";
+            return false;
+        }
+        for (Content& entry : folder.b_content) {
+            if (entry.b_inodo == -1) {
+                write_fixed(entry.b_name, 12, name);
+                entry.b_inodo = child_index;
+                if (!write_folder_block(file, sb, block_index, folder)) {
+                    error = "no se pudo actualizar la carpeta padre";
+                    return false;
+                }
+                parent.i_mtime = time(nullptr);
+                return write_inode(file, sb, parent_index, parent);
+            }
+        }
+    }
+
+    // La carpeta necesita otro bloque de datos. Preservar sus bloques de datos y
+    // reconstruir unicamente la estructura de apuntadores si ya fuera necesaria.
+    int new_block = allocate_block(file, sb);
+    if (new_block < 0) {
+        error = "no hay bloques libres para ampliar la carpeta";
+        return false;
+    }
+
+    FolderBlock folder{};
+    write_fixed(folder.b_content[0].b_name, 12, name);
+    folder.b_content[0].b_inodo = child_index;
+    if (!write_folder_block(file, sb, new_block, folder)) {
+        error = "no se pudo escribir el nuevo bloque de carpeta";
+        return false;
+    }
+
+    for (int pointer : pointer_blocks) {
+        if (!mark_free_without_rescan(file, sb, pointer)) {
+            error = "no se pudo liberar un bloque apuntador previo";
+            return false;
+        }
+    }
+
+    data_blocks.push_back(new_block);
+    if (!rebuild_inode_block_map(file, sb, parent, data_blocks, error)) return false;
+    parent.i_s = static_cast<int>(data_blocks.size()) * BLOCK_SIZE;
+    parent.i_mtime = time(nullptr);
+
+    if (!write_inode(file, sb, parent_index, parent)) {
+        error = "no se pudo actualizar el inodo de la carpeta padre";
+        return false;
+    }
+    if (!write_superblock(file, partition_start, sb)) {
+        error = "no se pudo actualizar el superbloque";
+        return false;
+    }
+    return true;
+}
+
+bool create_directory_child(FILE* file,
+                            int partition_start,
+                            Superblock& sb,
+                            int parent_index,
+                            Inode& parent,
+                            const string& name,
+                            int& new_inode_index,
+                            string& error) {
+    if (!has_permission(parent, 2)) {
+        error = "no tiene permiso de escritura en la carpeta padre";
+        return false;
+    }
+
+    int existing = -1;
+    if (!find_child(file, sb, parent, name, existing, error)) return false;
+    if (existing >= 0) {
+        error = "ya existe un archivo o carpeta con ese nombre";
+        return false;
+    }
+
+    int inode_index = allocate_inode_index(file, sb);
+    if (inode_index < 0) {
+        error = "no hay inodos libres";
+        return false;
+    }
+    int block_index = allocate_block(file, sb);
+    if (block_index < 0) {
+        error = "no hay bloques libres";
+        return false;
+    }
+
+    Inode child;
+    initialize_inode(child, current_session.uid, current_session.gid,
+                     sizeof(FolderBlock), '0', DEFAULT_PERM_664, block_index, time(nullptr));
+
+    FolderBlock folder{};
+    write_fixed(folder.b_content[0].b_name, 12, ".");
+    folder.b_content[0].b_inodo = inode_index;
+    write_fixed(folder.b_content[1].b_name, 12, "..");
+    folder.b_content[1].b_inodo = parent_index;
+
+    if (!write_inode(file, sb, inode_index, child) ||
+        !write_folder_block(file, sb, block_index, folder)) {
+        error = "no se pudieron escribir las estructuras de la nueva carpeta";
+        return false;
+    }
+
+    if (!append_directory_entry(file, partition_start, sb, parent_index,
+                                parent, name, inode_index, error)) return false;
+
+    if (!write_superblock(file, partition_start, sb)) {
+        error = "no se pudo actualizar el superbloque";
+        return false;
+    }
+    new_inode_index = inode_index;
+    return true;
+}
+
+bool ensure_parent_directory(FILE* file,
+                             int partition_start,
+                             Superblock& sb,
+                             const vector<string>& parent_parts,
+                             bool create_missing,
+                             int& parent_index,
+                             Inode& parent,
+                             string& error) {
+    parent_index = ROOT_INODE_INDEX;
+    if (!read_inode(file, sb, parent_index, parent)) {
+        error = "no se pudo leer el inodo raiz";
+        return false;
+    }
+
+    for (const string& part : parent_parts) {
+        int child_index = -1;
+        if (!find_child(file, sb, parent, part, child_index, error)) return false;
+
+        if (child_index < 0) {
+            if (!create_missing) {
+                error = "no existen todas las carpetas padre";
+                return false;
+            }
+            int created = -1;
+            if (!create_directory_child(file, partition_start, sb, parent_index,
+                                        parent, part, created, error)) return false;
+            child_index = created;
+        }
+
+        Inode child{};
+        if (!read_inode(file, sb, child_index, child)) {
+            error = "no se pudo leer una carpeta padre";
+            return false;
+        }
+        if (child.i_type != '0') {
+            error = "un componente padre de la ruta no es una carpeta";
+            return false;
+        }
+        parent_index = child_index;
+        parent = child;
+    }
+    return true;
+}
+
+bool read_host_file(const string& path, string& content, string& error) {
+    ifstream input(path, ios::binary);
+    if (!input) {
+        error = "el archivo indicado en -cont no existe o no se puede leer";
+        return false;
+    }
+    ostringstream buffer;
+    buffer << input.rdbuf();
+    if (!input.good() && !input.eof()) {
+        error = "no se pudo leer completamente el archivo indicado en -cont";
+        return false;
+    }
+    content = buffer.str();
+    return true;
+}
+
+string generated_content(int size) {
+    string content;
+    if (size <= 0) return content;
+    content.resize(static_cast<size_t>(size));
+    for (int i = 0; i < size; ++i) content[static_cast<size_t>(i)] = static_cast<char>('0' + (i % 10));
+    return content;
+}
+
+bool create_or_overwrite_file(FILE* file,
+                              int partition_start,
+                              Superblock& sb,
+                              int parent_index,
+                              Inode& parent,
+                              const string& name,
+                              const string& content,
+                              string& error,
+                              bool& overwritten) {
+    overwritten = false;
+    int existing = -1;
+    if (!find_child(file, sb, parent, name, existing, error)) return false;
+
+    if (existing >= 0) {
+        Inode inode{};
+        if (!read_inode(file, sb, existing, inode)) {
+            error = "no se pudo leer el archivo existente";
+            return false;
+        }
+        if (inode.i_type != '1') {
+            error = "ya existe una carpeta con ese nombre";
+            return false;
+        }
+        if (!has_permission(inode, 2)) {
+            error = "no tiene permiso de escritura sobre el archivo existente";
+            return false;
+        }
+        if (!write_inode_file(file, partition_start, sb, existing, inode, content, error)) return false;
+        overwritten = true;
+        return true;
+    }
+
+    if (!has_permission(parent, 2)) {
+        error = "no tiene permiso de escritura en la carpeta padre";
+        return false;
+    }
+
+    int inode_index = allocate_inode_index(file, sb);
+    if (inode_index < 0) {
+        error = "no hay inodos libres";
+        return false;
+    }
+
+    Inode inode;
+    initialize_inode(inode, current_session.uid, current_session.gid, 0, '1',
+                     DEFAULT_PERM_664, -1, time(nullptr));
+
+    if (!write_inode(file, sb, inode_index, inode)) {
+        error = "no se pudo escribir el inodo del archivo";
+        return false;
+    }
+    if (!write_inode_file(file, partition_start, sb, inode_index, inode, content, error)) return false;
+
+    // write_inode_file actualiza el superbloque con la asignacion de bloques; la
+    // copia local sb conserva esos cambios y se utiliza al insertar la entrada.
+    if (!append_directory_entry(file, partition_start, sb, parent_index,
+                                parent, name, inode_index, error)) return false;
+    if (!write_superblock(file, partition_start, sb)) {
+        error = "no se pudo actualizar el superbloque";
+        return false;
+    }
+    return true;
+}
+
+struct UserIdentity {
+    int uid = -1;
+    int gid = -1;
+    string user;
+    string group;
+};
+
+vector<string> csv_fields(const string& line) {
+    vector<string> out;
+    string field;
+    stringstream ss(line);
+    while (getline(ss, field, ',')) out.push_back(trim(field));
+    return out;
+}
+
+bool lookup_user_identity(const string& user, UserIdentity& identity, string& error) {
+    string content;
+    if (!fs_read_users_file(current_session.id, content, error)) return false;
+
+    map<string, int> groups;
+    struct Candidate { int uid; string group; string user; } candidate{-1, "", ""};
+
+    string line;
+    stringstream ss(content);
+    while (getline(ss, line)) {
+        vector<string> fields = csv_fields(line);
+        if (fields.size() < 3) continue;
+        int id = -1;
+        if (!strict_stoi(fields[0], id) || id <= 0) continue;
+        if (fields[1] == "G" && fields.size() >= 3) {
+            groups[fields[2]] = id;
+        } else if (fields[1] == "U" && fields.size() >= 5 && fields[3] == user) {
+            candidate = {id, fields[2], fields[3]};
+        }
+    }
+
+    if (candidate.uid < 0) {
+        error = "el usuario indicado no existe";
+        return false;
+    }
+    auto git = groups.find(candidate.group);
+    if (git == groups.end()) {
+        error = "el grupo del usuario indicado no existe";
+        return false;
+    }
+
+    identity.uid = candidate.uid;
+    identity.gid = git->second;
+    identity.user = candidate.user;
+    identity.group = candidate.group;
+    return true;
+}
+
+bool collect_children(FILE* file,
+                      const Superblock& sb,
+                      const Inode& directory,
+                      vector<int>& children,
+                      string& error) {
+    children.clear();
+    if (directory.i_type != '0') return true;
+    vector<int> blocks;
+    if (!inode_data_blocks(file, sb, directory, blocks, error)) return false;
+    for (int block_index : blocks) {
+        FolderBlock folder{};
+        if (!read_folder_block(file, sb, block_index, folder)) {
+            error = "no se pudo leer un bloque de carpeta";
+            return false;
+        }
+        for (const Content& entry : folder.b_content) {
+            if (entry.b_inodo < 0) continue;
+            string name = read_fixed(entry.b_name, 12);
+            if (name == "." || name == "..") continue;
+            children.push_back(entry.b_inodo);
+        }
+    }
+    return true;
+}
+
+bool recurse_inode_tree(FILE* file,
+                        const Superblock& sb,
+                        int start_index,
+                        const function<bool(int, Inode&, string&)>& action,
+                        string& error) {
+    set<int> visited;
+    function<bool(int)> visit = [&](int index) -> bool {
+        if (visited.count(index)) return true;
+        visited.insert(index);
+
+        Inode inode{};
+        if (!read_inode(file, sb, index, inode)) {
+            error = "no se pudo leer un inodo durante la operacion recursiva";
+            return false;
+        }
+        if (!action(index, inode, error)) return false;
+
+        if (inode.i_type == '0') {
+            vector<int> children;
+            if (!collect_children(file, sb, inode, children, error)) return false;
+            for (int child : children) {
+                if (!visit(child)) return false;
+            }
+        }
+        return true;
+    };
+    return visit(start_index);
+}
+
+bool parse_ugo(const string& text, char out[3]) {
+    if (text.size() != 3) return false;
+    for (int i = 0; i < 3; ++i) {
+        if (text[i] < '0' || text[i] > '7') return false;
+        out[i] = text[i];
+    }
+    return true;
+}
+
+} // namespace
+
+void cmd_mkdir(map<string, string>& params) {
+    if (!require_fs_session("MKDIR")) return;
+    auto it = params.find("path");
+    if (it == params.end() || it->second.empty()) {
+        cout << "[ERROR] MKDIR: falta parametro -path" << endl;
+        return;
+    }
+
+    vector<string> parts;
+    string error;
+    if (!parse_absolute_path(it->second, parts, error) || parts.empty()) {
+        cout << "[ERROR] MKDIR: " << (error.empty() ? "ruta invalida" : error) << endl;
+        return;
+    }
+    bool recursive = params.count("p") > 0;
+
+    string disk_path;
+    Partition part;
+    Superblock sb;
+    if (!fs_load_context(current_session.id, disk_path, part, sb, error)) {
+        cout << "[ERROR] MKDIR: " << error << endl;
+        return;
+    }
+
+    FILE* file = fopen(disk_path.c_str(), "r+b");
+    if (!file) {
+        cout << "[ERROR] MKDIR: no se pudo abrir el disco" << endl;
+        return;
+    }
+
+    string leaf = parts.back();
+    parts.pop_back();
+    int parent_index = -1;
+    Inode parent{};
+    if (!ensure_parent_directory(file, part.part_start, sb, parts, recursive,
+                                 parent_index, parent, error)) {
+        fclose(file);
+        cout << "[ERROR] MKDIR: " << error << endl;
+        return;
+    }
+
+    int existing = -1;
+    if (!find_child(file, sb, parent, leaf, existing, error)) {
+        fclose(file);
+        cout << "[ERROR] MKDIR: " << error << endl;
+        return;
+    }
+    if (existing >= 0) {
+        fclose(file);
+        if (recursive) cout << "[OK] MKDIR: la carpeta ya existe, no se realizaron cambios" << endl;
+        else cout << "[ERROR] MKDIR: ya existe un archivo o carpeta con ese nombre" << endl;
+        return;
+    }
+
+    int created = -1;
+    bool ok = create_directory_child(file, part.part_start, sb, parent_index,
+                                     parent, leaf, created, error);
+    fflush(file);
+    fclose(file);
+    if (!ok) {
+        cout << "[ERROR] MKDIR: " << error << endl;
+        return;
+    }
+    cout << "[OK] MKDIR: carpeta creada " << it->second << endl;
+}
+
+void cmd_mkfile(map<string, string>& params) {
+    if (!require_fs_session("MKFILE")) return;
+    auto pit = params.find("path");
+    if (pit == params.end() || pit->second.empty()) {
+        cout << "[ERROR] MKFILE: falta parametro -path" << endl;
+        return;
+    }
+
+    int requested_size = 0;
+    auto sit = params.find("size");
+    if (sit != params.end()) {
+        if (!strict_stoi(sit->second, requested_size) || requested_size < 0) {
+            cout << "[ERROR] MKFILE: -size debe ser un entero mayor o igual a 0" << endl;
+            return;
+        }
+    }
+
+    string content;
+    string error;
+    auto cit = params.find("cont");
+    if (cit != params.end()) {
+        if (!read_host_file(cit->second, content, error)) {
+            cout << "[ERROR] MKFILE: " << error << endl;
+            return;
+        }
+    } else {
+        content = generated_content(requested_size);
+    }
+
+    vector<string> parts;
+    if (!parse_absolute_path(pit->second, parts, error) || parts.empty()) {
+        cout << "[ERROR] MKFILE: " << (error.empty() ? "ruta invalida" : error) << endl;
+        return;
+    }
+    bool recursive = params.count("r") > 0;
+
+    string disk_path;
+    Partition part;
+    Superblock sb;
+    if (!fs_load_context(current_session.id, disk_path, part, sb, error)) {
+        cout << "[ERROR] MKFILE: " << error << endl;
+        return;
+    }
+
+    FILE* file = fopen(disk_path.c_str(), "r+b");
+    if (!file) {
+        cout << "[ERROR] MKFILE: no se pudo abrir el disco" << endl;
+        return;
+    }
+
+    string leaf = parts.back();
+    parts.pop_back();
+    int parent_index = -1;
+    Inode parent{};
+    if (!ensure_parent_directory(file, part.part_start, sb, parts, recursive,
+                                 parent_index, parent, error)) {
+        fclose(file);
+        cout << "[ERROR] MKFILE: " << error << endl;
+        return;
+    }
+
+    bool overwritten = false;
+    bool ok = create_or_overwrite_file(file, part.part_start, sb, parent_index,
+                                       parent, leaf, content, error, overwritten);
+    fflush(file);
+    fclose(file);
+    if (!ok) {
+        cout << "[ERROR] MKFILE: " << error << endl;
+        return;
+    }
+
+    if (overwritten) {
+        cout << "[INFO] MKFILE: el archivo ya existia; se sobreescribio su contenido" << endl;
+    }
+    cout << "[OK] MKFILE: archivo " << pit->second << " creado (" << content.size() << " bytes)" << endl;
+}
+
+void cmd_cat(map<string, string>& params) {
+    if (!require_fs_session("CAT")) return;
+    if (params.empty()) {
+        cout << "[ERROR] CAT: requiere al menos -file1" << endl;
+        return;
+    }
+
+    vector<pair<int, string>> files;
+    for (const auto& [key, value] : params) {
+        if (key.rfind("file", 0) != 0 || key.size() <= 4) {
+            cout << "[ERROR] CAT: parametro no reconocido -" << key << endl;
+            return;
+        }
+        int number = 0;
+        if (!strict_stoi(key.substr(4), number) || number <= 0) {
+            cout << "[ERROR] CAT: los parametros deben usar -fileN con N positivo" << endl;
+            return;
+        }
+        files.push_back({number, value});
+    }
+    sort(files.begin(), files.end());
+
+    string disk_path;
+    Partition part;
+    Superblock sb;
+    string error;
+    if (!fs_load_context(current_session.id, disk_path, part, sb, error)) {
+        cout << "[ERROR] CAT: " << error << endl;
+        return;
+    }
+
+    FILE* file = fopen(disk_path.c_str(), "rb");
+    if (!file) {
+        cout << "[ERROR] CAT: no se pudo abrir el disco" << endl;
+        return;
+    }
+
+    vector<string> outputs;
+    for (const auto& item : files) {
+        vector<string> parts;
+        if (!parse_absolute_path(item.second, parts, error) || parts.empty()) {
+            fclose(file);
+            cout << "[ERROR] CAT: " << (error.empty() ? "ruta invalida" : error) << endl;
+            return;
+        }
+
+        int inode_index = -1;
+        Inode inode{};
+        if (!resolve_inode_path(file, sb, parts, inode_index, inode, error)) {
+            fclose(file);
+            cout << "[ERROR] CAT: " << item.second << ": " << error << endl;
+            return;
+        }
+        if (inode.i_type != '1') {
+            fclose(file);
+            cout << "[ERROR] CAT: " << item.second << " no es un archivo" << endl;
+            return;
+        }
+        if (!has_permission(inode, 4)) {
+            fclose(file);
+            cout << "[ERROR] CAT: no tiene permiso de lectura sobre " << item.second << endl;
+            return;
+        }
+
+        string content;
+        if (!read_inode_file(file, sb, inode, content, error)) {
+            fclose(file);
+            cout << "[ERROR] CAT: " << error << endl;
+            return;
+        }
+        outputs.push_back(content);
+    }
+    fclose(file);
+
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        cout << outputs[i];
+        if (i + 1 < outputs.size()) cout << '\n';
+    }
+    cout << endl;
+}
+
+void cmd_chmod(map<string, string>& params) {
+    if (!require_fs_session("CHMOD")) return;
+    auto pit = params.find("path");
+    auto uit = params.find("ugo");
+    if (pit == params.end() || uit == params.end()) {
+        cout << "[ERROR] CHMOD: requiere -path y -ugo" << endl;
+        return;
+    }
+
+    char perms[3];
+    if (!parse_ugo(uit->second, perms)) {
+        cout << "[ERROR] CHMOD: -ugo debe contener exactamente tres digitos octales (000-777)" << endl;
+        return;
+    }
+
+    vector<string> parts;
+    string error;
+    if (!parse_absolute_path(pit->second, parts, error)) {
+        cout << "[ERROR] CHMOD: " << error << endl;
+        return;
+    }
+
+    string disk_path;
+    Partition part;
+    Superblock sb;
+    if (!fs_load_context(current_session.id, disk_path, part, sb, error)) {
+        cout << "[ERROR] CHMOD: " << error << endl;
+        return;
+    }
+    FILE* file = fopen(disk_path.c_str(), "r+b");
+    if (!file) {
+        cout << "[ERROR] CHMOD: no se pudo abrir el disco" << endl;
+        return;
+    }
+
+    int target = -1;
+    Inode target_inode{};
+    if (!resolve_inode_path(file, sb, parts, target, target_inode, error)) {
+        fclose(file);
+        cout << "[ERROR] CHMOD: " << error << endl;
+        return;
+    }
+
+    bool recursive = params.count("r") > 0;
+    bool root = current_session.uid == 1 && current_session.user == "root";
+    auto action = [&](int index, Inode& inode, string& action_error) -> bool {
+        if (!root && inode.i_uid != current_session.uid) {
+            action_error = "solo root o el propietario pueden cambiar permisos";
+            return false;
+        }
+        memcpy(inode.i_perm, perms, 3);
+        inode.i_mtime = time(nullptr);
+        if (!write_inode(file, sb, index, inode)) {
+            action_error = "no se pudo actualizar un inodo";
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = false;
+    if (recursive) ok = recurse_inode_tree(file, sb, target, action, error);
+    else ok = action(target, target_inode, error);
+    fflush(file);
+    fclose(file);
+
+    if (!ok) {
+        cout << "[ERROR] CHMOD: " << error << endl;
+        return;
+    }
+    cout << "[OK] CHMOD: permisos " << uit->second << " aplicados a " << pit->second
+         << (recursive ? " recursivamente" : "") << endl;
+}
+
+void cmd_chown(map<string, string>& params) {
+    if (!require_fs_session("CHOWN")) return;
+    if (!(current_session.uid == 1 && current_session.user == "root")) {
+        cout << "[ERROR] CHOWN: solo el usuario root puede cambiar propietarios" << endl;
+        return;
+    }
+
+    auto pit = params.find("path");
+    auto uit = params.find("user");
+    if (pit == params.end() || uit == params.end()) {
+        cout << "[ERROR] CHOWN: requiere -path y -user" << endl;
+        return;
+    }
+
+    UserIdentity identity;
+    string error;
+    if (!lookup_user_identity(uit->second, identity, error)) {
+        cout << "[ERROR] CHOWN: " << error << endl;
+        return;
+    }
+
+    vector<string> parts;
+    if (!parse_absolute_path(pit->second, parts, error)) {
+        cout << "[ERROR] CHOWN: " << error << endl;
+        return;
+    }
+
+    string disk_path;
+    Partition part;
+    Superblock sb;
+    if (!fs_load_context(current_session.id, disk_path, part, sb, error)) {
+        cout << "[ERROR] CHOWN: " << error << endl;
+        return;
+    }
+    FILE* file = fopen(disk_path.c_str(), "r+b");
+    if (!file) {
+        cout << "[ERROR] CHOWN: no se pudo abrir el disco" << endl;
+        return;
+    }
+
+    int target = -1;
+    Inode target_inode{};
+    if (!resolve_inode_path(file, sb, parts, target, target_inode, error)) {
+        fclose(file);
+        cout << "[ERROR] CHOWN: " << error << endl;
+        return;
+    }
+
+    bool recursive = params.count("r") > 0;
+    auto action = [&](int index, Inode& inode, string& action_error) -> bool {
+        inode.i_uid = identity.uid;
+        inode.i_gid = identity.gid;
+        inode.i_mtime = time(nullptr);
+        if (!write_inode(file, sb, index, inode)) {
+            action_error = "no se pudo actualizar un inodo";
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = false;
+    if (recursive) ok = recurse_inode_tree(file, sb, target, action, error);
+    else ok = action(target, target_inode, error);
+    fflush(file);
+    fclose(file);
+
+    if (!ok) {
+        cout << "[ERROR] CHOWN: " << error << endl;
+        return;
+    }
+    cout << "[OK] CHOWN: propietario de " << pit->second << " cambiado a " << uit->second
+         << (recursive ? " recursivamente" : "") << endl;
 }
