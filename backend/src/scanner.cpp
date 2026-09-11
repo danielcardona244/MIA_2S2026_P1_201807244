@@ -4,6 +4,7 @@
 #include "mount.h"
 #include "filesystem.h"
 #include "users.h"
+#include "reports.h"
 
 #include <iostream>
 #include <sstream>
@@ -12,7 +13,7 @@
 
 using namespace std;
 
-// Parametros permitidos por los comandos implementados hasta Sprint 4.
+// Parametros permitidos por los comandos implementados hasta Sprint 5.
 static const map<string, set<string>> allowed_params = {
     {"mkdisk",  {"size", "fit", "unit", "path"}},
     {"rmdisk",  {"path"}},
@@ -31,6 +32,7 @@ static const map<string, set<string>> allowed_params = {
     {"mkdir",   {"path", "p"}},
     {"chmod",   {"path", "ugo", "r"}},
     {"chown",   {"path", "user", "r"}},
+    {"rep",     {"name", "path", "id", "path_file_ls"}},
 };
 
 static const map<string, set<string>> flag_params = {
@@ -200,6 +202,8 @@ void process_line(const string& line) {
         cmd_chmod(params);
     } else if (cmd == "chown") {
         cmd_chown(params);
+    } else if (cmd == "rep") {
+        cmd_rep(params);
     } else if (cmd == "exit") {
         // se maneja en main
     } else {
